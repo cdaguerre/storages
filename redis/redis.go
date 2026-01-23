@@ -7,13 +7,28 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/darkweak/storages/core"
 	"github.com/pierrec/lz4/v4"
 	redis "github.com/redis/rueidis"
+	"google.golang.org/protobuf/proto"
 )
+
+const (
+	// MappingTimestampIndex is the sorted set key that tracks all mapping entries by staleTime.
+	// This enables efficient eviction without SCAN operations.
+	// See: https://github.com/darkweak/souin/issues/671
+	MappingTimestampIndex = "IDX_TIMESTAMPS"
+)
+
+// mappingEntry represents a single entry in the mapping timestamp index.
+type mappingEntry struct {
+	MappingKey string `json:"m"` // The IDX_ prefixed mapping key
+	VariedKey  string `json:"v"` // The varied key within the mapping
+}
 
 // Redis provider type.
 type Redis struct {
@@ -210,6 +225,27 @@ func (provider *Redis) SetMultiLevel(baseKey, variedKey string, value []byte, va
 
 	if err = provider.inClient.Do(provider.ctx, provider.inClient.B().Set().Key(mappingKey).Value(string(val)).Build()).Error(); err != nil {
 		provider.logger.Errorf("Impossible to set value into Redis, %v", err)
+		return err
+	}
+
+	// Add entry to the timestamp sorted set for efficient eviction.
+	// See: https://github.com/darkweak/souin/issues/671
+	staleTime := now.Add(duration + provider.stale).Unix()
+	entry := mappingEntry{
+		MappingKey: mappingKey,
+		VariedKey:  provider.hashtags + variedKey,
+	}
+	entryJSON, _ := json.Marshal(entry)
+
+	if err = provider.inClient.Do(
+		provider.ctx,
+		provider.inClient.B().Zadd().
+			Key(provider.hashtags+MappingTimestampIndex).
+			ScoreMember().
+			ScoreMember(float64(staleTime), string(entryJSON)).
+			Build(),
+	).Error(); err != nil {
+		provider.logger.Errorf("Impossible to set value into Redis, %v", err)
 	}
 
 	return err
@@ -282,4 +318,106 @@ func (provider *Redis) Reset() error {
 
 func (provider *Redis) Reconnect() {
 	provider.logger.Debug("Doing nothing on reconnect because rueidis handles it!")
+}
+
+// EvictExpiredMappingEntries removes expired entries from mapping keys using sorted sets.
+// This method avoids expensive SCAN operations by using ZRANGEBYSCORE.
+// Returns true to indicate that eviction was handled (no fallback to SCAN needed).
+// See: https://github.com/darkweak/souin/issues/671
+func (provider *Redis) EvictExpiredMappingEntries() bool {
+	now := time.Now().Unix()
+	nowStr := strconv.FormatInt(now, 10)
+
+	// Get all expired entries (score <= now) from the sorted set
+	expiredEntries, err := provider.inClient.Do(
+		provider.ctx,
+		provider.inClient.B().Zrangebyscore().
+			Key(provider.hashtags+MappingTimestampIndex).
+			Min("-inf").
+			Max(nowStr).
+			Build(),
+	).AsStrSlice()
+
+	if err != nil {
+		provider.logger.Errorf("Error getting expired mapping entries: %v", err)
+		return true // Still return true to avoid SCAN fallback
+	}
+
+	if len(expiredEntries) == 0 {
+		return true
+	}
+
+	// Process expired entries
+	for _, entryJSON := range expiredEntries {
+		var entry mappingEntry
+		if err := json.Unmarshal([]byte(entryJSON), &entry); err != nil {
+			provider.logger.Errorf("Error unmarshaling mapping entry: %v", err)
+			continue
+		}
+
+		// Load the mapping and remove the expired varied key
+		provider.removeExpiredEntryFromMapping(entry.MappingKey, entry.VariedKey)
+	}
+
+	// Remove all processed entries from the sorted set
+	if len(expiredEntries) > 0 {
+		err = provider.inClient.Do(
+			provider.ctx,
+			provider.inClient.B().Zrem().
+				Key(provider.hashtags+MappingTimestampIndex).
+				Member(expiredEntries...).
+				Build(),
+		).Error()
+
+		if err != nil {
+			provider.logger.Errorf("Error removing expired entries from sorted set: %v", err)
+		}
+	}
+
+	return true
+}
+
+// removeExpiredEntryFromMapping removes a specific varied key from a mapping.
+func (provider *Redis) removeExpiredEntryFromMapping(mappingKey, variedKey string) {
+	// Get the current mapping
+	item, err := provider.inClient.Do(
+		provider.ctx,
+		provider.inClient.B().Get().Key(mappingKey).Build(),
+	).AsBytes()
+
+	if err != nil || len(item) == 0 {
+		return
+	}
+
+	mapping := &core.StorageMapper{}
+	if err := proto.Unmarshal(item, mapping); err != nil {
+		// Corrupted mapping, delete it
+		provider.Delete(mappingKey)
+		return
+	}
+
+	// Remove the expired entry
+	if _, exists := mapping.GetMapping()[variedKey]; exists {
+		delete(mapping.Mapping, variedKey)
+
+		if len(mapping.GetMapping()) == 0 {
+			// No more entries, delete the entire mapping
+			provider.Delete(mappingKey)
+		} else {
+			// Re-save the mapping with the entry removed
+			val, err := proto.Marshal(mapping)
+			if err != nil {
+				provider.logger.Errorf("Error marshaling mapping: %v", err)
+				return
+			}
+
+			_ = provider.inClient.Do(
+				provider.ctx,
+				provider.inClient.B().Set().
+					Key(mappingKey).
+					Value(string(val)).
+					Build(),
+			)
+		}
+	}
 }
