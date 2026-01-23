@@ -167,3 +167,129 @@ func TestRedis_DeleteMany(t *testing.T) {
 		t.Error("The map should be empty")
 	}
 }
+
+func TestRedis_EvictExpiredMappingEntries(t *testing.T) {
+	client, err := getRedisInstance()
+	if err != nil {
+		t.Fatalf("Failed to create Redis instance: %v", err)
+	}
+
+	// Clean up before test
+	client.DeleteMany(".*")
+
+	// Cast to access the EvictExpiredMappingEntries method
+	redisClient, ok := client.(*redis.Redis)
+	if !ok {
+		t.Fatal("Failed to cast to *redis.Redis")
+	}
+
+	// Test that EvictExpiredMappingEntries returns true (indicating it handles eviction)
+	result := redisClient.EvictExpiredMappingEntries()
+	if !result {
+		t.Error("EvictExpiredMappingEntries should return true")
+	}
+
+	// Clean up after test
+	client.DeleteMany(".*")
+}
+
+func TestRedis_EvictExpiredMappingEntries_WithExpiredEntries(t *testing.T) {
+	client, err := getRedisInstance()
+	if err != nil {
+		t.Fatalf("Failed to create Redis instance: %v", err)
+	}
+
+	// Clean up before test
+	client.DeleteMany(".*")
+
+	// Use SetMultiLevel to create a mapping entry with a short but valid duration
+	// This will add an entry to the IDX_TIMESTAMPS sorted set
+	baseKey := "test-evict-base"
+	variedKey := "test-evict-varied"
+	value := []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ntest body")
+
+	// Use 1 second duration - Redis requires at least 1 second for expiry
+	err = client.SetMultiLevel(baseKey, variedKey, value, nil, "", 1*time.Second, "test-real-key")
+	if err != nil {
+		t.Fatalf("Failed to set multi-level: %v", err)
+	}
+
+	// Verify the mapping was created
+	mappingKey := core.MappingKeyPrefix + baseKey
+	mappingValue := client.Get(mappingKey)
+	if len(mappingValue) == 0 {
+		t.Error("Mapping should have been created")
+	}
+
+	// Wait for the entry to expire (stale time = duration + stale, but stale is 0 in test)
+	time.Sleep(2 * time.Second)
+
+	// Cast to access the EvictExpiredMappingEntries method
+	redisClient, ok := client.(*redis.Redis)
+	if !ok {
+		t.Fatal("Failed to cast to *redis.Redis")
+	}
+
+	// Run eviction
+	result := redisClient.EvictExpiredMappingEntries()
+	if !result {
+		t.Error("EvictExpiredMappingEntries should return true")
+	}
+
+	// The mapping key should be deleted since it only had one entry
+	mappingValue = client.Get(mappingKey)
+	if len(mappingValue) != 0 {
+		t.Error("Mapping should have been deleted after eviction")
+	}
+
+	// Clean up after test
+	client.DeleteMany(".*")
+}
+
+func TestRedis_EvictExpiredMappingEntries_NoExpiredEntries(t *testing.T) {
+	client, err := getRedisInstance()
+	if err != nil {
+		t.Fatalf("Failed to create Redis instance: %v", err)
+	}
+
+	// Clean up before test
+	client.DeleteMany(".*")
+
+	// Use SetMultiLevel to create a mapping entry with a long duration
+	baseKey := "test-no-evict-base"
+	variedKey := "test-no-evict-varied"
+	value := []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ntest body")
+
+	err = client.SetMultiLevel(baseKey, variedKey, value, nil, "", 1*time.Hour, "test-real-key")
+	if err != nil {
+		t.Fatalf("Failed to set multi-level: %v", err)
+	}
+
+	// Verify the mapping was created
+	mappingKey := core.MappingKeyPrefix + baseKey
+	mappingValue := client.Get(mappingKey)
+	if len(mappingValue) == 0 {
+		t.Error("Mapping should have been created")
+	}
+
+	// Cast to access the EvictExpiredMappingEntries method
+	redisClient, ok := client.(*redis.Redis)
+	if !ok {
+		t.Fatal("Failed to cast to *redis.Redis")
+	}
+
+	// Run eviction - should not remove anything since entry hasn't expired
+	result := redisClient.EvictExpiredMappingEntries()
+	if !result {
+		t.Error("EvictExpiredMappingEntries should return true")
+	}
+
+	// The mapping should still exist
+	mappingValue = client.Get(mappingKey)
+	if len(mappingValue) == 0 {
+		t.Error("Mapping should still exist after eviction of non-expired entries")
+	}
+
+	// Clean up after test
+	client.DeleteMany(".*")
+}
